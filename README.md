@@ -1,83 +1,87 @@
-# Piper TTS API on Render
+# Kelku TTS
 
-FastAPI + Piper TTS with four voices:
-- `hfc_male` -> `en_US-hfc_male-medium`
-- `libritts_r` -> `en_US-libritts_r-medium`
-- `ryan` -> `en_US-ryan-medium` (default)
-- `arjun` -> `ml_IN-arjun-medium`
+A Dockerized FastAPI text-to-speech API using Piper TTS. It supports four voices:
 
-The Docker build downloads the Piper Linux x86-64 executable and only the four selected ONNX models plus their JSON configuration files.
+- `hfc_male` → `en_US-hfc_male-medium`
+- `libritts_r` → `en_US-libritts_r-medium`
+- `ryan` → `en_US-ryan-medium` (default)
+- `arjun` → `ml_IN-arjun-medium` (Malayalam)
 
-## Deploy to Render
+The Docker image downloads the Piper executable and exactly these four voice models during build.
 
-1. Download and unzip this project.
-2. Create a new GitHub repository, for example `piper-tts-api`.
-3. Upload the files from this folder to the repository root. Do not upload ONNX models; the Docker build downloads them.
-4. Sign in to Render and choose **New + → Web Service**.
-5. Connect your GitHub repository.
-6. Select the **Docker** runtime if asked. The repository's `Dockerfile` is used automatically.
-7. Choose the Free plan if it is available for your account and service.
-8. Set health check path to `/health` if Render does not pick it up from `render.yaml`.
-9. Click **Create Web Service** and monitor the build and deploy logs. The first build downloads several hundred MB and can take a while.
-10. When deployment is live, open `https://YOUR-SERVICE-NAME.onrender.com/health`.
+## API
 
-Render supplies the `PORT` environment variable. The Docker command listens on that port, defaulting to `10000` for local use.
+- `GET /` service info
+- `GET /health` health check
+- `GET /docs` interactive API docs
+- `GET /generate?text=Hello%20world&voice=ryan` returns WAV audio
 
-## Test endpoints
+Text is limited to 2,000 characters per request. This is a CPU-based service, not a guarantee of unlimited throughput.
 
-Replace `YOUR-SERVICE-NAME` with the actual Render service hostname.
+## Deploy on Render
 
-- `https://YOUR-SERVICE-NAME.onrender.com/`
-- `https://YOUR-SERVICE-NAME.onrender.com/health`
-- `https://YOUR-SERVICE-NAME.onrender.com/generate?text=Hello%20world&voice=ryan`
-- `https://YOUR-SERVICE-NAME.onrender.com/generate?text=%E0%B4%A8%E0%B4%AE%E0%B4%B8%E0%B5%8D%E0%B4%95%E0%B4%BE%E0%B4%B0%E0%B4%82&voice=arjun`
+1. Create a GitHub repository named `kelku-tts`.
+2. Upload the files from this folder to the repository root.
+3. Open https://render.com and sign in.
+4. Select **New + → Web Service** and connect the GitHub repository.
+5. Set the service name to `kelku-tts`.
+6. Set **Language/Runtime** to **Docker**. Keep the Dockerfile path as `./Dockerfile`.
+7. Choose the Free plan if it is available for your account and region.
+8. In Advanced settings, set the health check path to `/health`.
+9. Create the Web Service and wait for the Docker build and deploy to finish.
+10. Open the `onrender.com` URL Render assigns to your service.
 
-The `/generate` endpoint returns `audio/wav`.
+The Dockerfile reads Render's `PORT` environment variable and listens on `0.0.0.0`.
 
-## JavaScript example
+## Test
+
+Open these URLs, replacing `YOUR-SERVICE.onrender.com` with your Render hostname:
+
+```text
+https://YOUR-SERVICE.onrender.com/health
+https://YOUR-SERVICE.onrender.com/generate?text=Hello%20world&voice=ryan
+https://YOUR-SERVICE.onrender.com/generate?text=Hello%20world&voice=hfc_male
+https://YOUR-SERVICE.onrender.com/generate?text=Hello%20world&voice=libritts_r
+https://YOUR-SERVICE.onrender.com/generate?text=%E0%B4%A8%E0%B4%AE%E0%B4%B8%E0%B5%8D%E0%B4%95%E0%B4%BE%E0%B4%B0%E0%B4%82&voice=arjun
+```
+
+## Frontend JavaScript
 
 ```javascript
-async function speakText(text, voice = "ryan") {
-  const baseUrl = "https://YOUR-SERVICE-NAME.onrender.com/generate";
-  const params = new URLSearchParams({ text, voice });
-  const response = await fetch(`${baseUrl}?${params}`);
+async function playKelkuTTS(text, voice = "ryan") {
+  const baseUrl = "https://YOUR-SERVICE.onrender.com";
+  const query = new URLSearchParams({ text, voice });
+  const response = await fetch(`${baseUrl}/generate?${query}`);
 
   if (!response.ok) {
     throw new Error(`TTS request failed (${response.status}): ${await response.text()}`);
   }
 
   const audioBlob = await response.blob();
-  const objectUrl = URL.createObjectURL(audioBlob);
-  const audio = new Audio(objectUrl);
+  const audioUrl = URL.createObjectURL(audioBlob);
+  const audio = new Audio(audioUrl);
 
-  audio.addEventListener("ended", () => URL.revokeObjectURL(objectUrl), { once: true });
+  audio.addEventListener("ended", () => URL.revokeObjectURL(audioUrl), { once: true });
   await audio.play();
 }
 
-speakText("Hello from Piper", "ryan");
-// speakText("നമസ്കാരം", "arjun");
+playKelkuTTS("Hello from Kelku TTS", "ryan");
+// Malayalam example: playKelkuTTS("നമസ്കാരം", "arjun");
 ```
 
 ## Local Docker test
 
-Build:
 ```bash
-docker build -t piper-tts-api .
+docker build -t kelku-tts .
+docker run --rm -p 10000:10000 -e PORT=10000 kelku-tts
 ```
 
-Run:
-```bash
-docker run --rm -p 10000:10000 -e PORT=10000 piper-tts-api
-```
-
-Then open `http://localhost:10000/health`.
+Then open `http://localhost:10000/docs`.
 
 ## Important limitations
 
-- This is not unlimited hosting. Free services have CPU, memory, usage, and availability constraints, and may spin down when idle.
-- A cold request after spin-down may be slow.
-- This version launches a Piper process for each request, so it is a straightforward starter implementation, not the lowest possible latency architecture.
-- The endpoint is public and CORS is open by request. CORS is not access control. Add authentication and rate limiting before exposing it to untrusted users.
-- The Piper executable URL targets Linux x86-64. If your deployment uses a different CPU architecture, use the matching Piper release asset.
-- Model URLs currently use the repository's `main` branch. For strict reproducibility, pin them to a verified commit.
-- Check the Piper and voice-model licenses for your intended usage.
+- Render Free web services spin down after 15 minutes without inbound traffic and can take around a minute to wake up.
+- Free instances have usage limits and are not suitable for guaranteed unlimited or always-on production service.
+- The service starts a Piper subprocess per request. It is a simple baseline, not a persistent-model ultra-low-latency implementation.
+- Voice model licenses vary. Review each voice's model card before commercial use.
+- The Docker build uses a versioned Piper release URL and the `main` branch of the voice repository. For reproducible builds, verify the release asset and pin the model repository to a specific commit.
