@@ -9,6 +9,10 @@ A Dockerized FastAPI text-to-speech API using Piper TTS. It supports four voices
 
 The Docker image downloads the Piper executable and exactly these four voice models during build.
 
+## Web UI
+
+The root URL (`/`) serves a responsive web interface where visitors can enter text, select one of the four voices, generate speech, play it, and download the WAV. API documentation remains available at `/docs`.
+
 ## API
 
 - `GET /` service info
