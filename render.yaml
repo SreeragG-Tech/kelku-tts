@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: piper-tts-api
-    runtime: docker
-    plan: free
-    healthCheckPath: /health
-    envVars:
-      - key: MAX_CONCURRENT_GENERATIONS
-        value: "1"
