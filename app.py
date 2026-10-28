@@ -1,29 +1,34 @@
 import asyncio
+import io
 import os
-import tempfile
+import threading
+import time
+import wave
+from collections import OrderedDict
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import HTMLResponse, Response
+from piper import PiperVoice
 
 APP_HOME = Path("/app")
 MODELS_DIR = APP_HOME / "models"
-PIPER_BIN = "/usr/local/bin/piper"
 MAX_TEXT_LENGTH = 2000
-GENERATION_TIMEOUT_SECONDS = 60
-MAX_CONCURRENT_GENERATIONS = 2
 
-generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
-
+# Render Free is memory-constrained. Keep a small LRU cache of loaded ONNX
+# sessions rather than loading all four models at once.
+MODEL_CACHE_SIZE = max(1, int(os.getenv("PIPER_MODEL_CACHE_SIZE", "2")))
 VOICES = {
     "hfc_male": MODELS_DIR / "en_US-hfc_male-medium.onnx",
     "libritts_r": MODELS_DIR / "en_US-libritts_r-medium.onnx",
     "ryan": MODELS_DIR / "en_US-ryan-medium.onnx",
     "arjun": MODELS_DIR / "ml_IN-arjun-medium.onnx",
 }
+
+_voice_cache = OrderedDict()
+_inference_lock = threading.RLock()
 
 app = FastAPI(
     title="Kelku TTS",
@@ -40,18 +45,37 @@ app.add_middleware(
 )
 
 
+def get_voice(voice_name: str) -> PiperVoice:
+    """Load a voice once and keep recently used models resident in memory."""
+    with _inference_lock:
+        voice = _voice_cache.get(voice_name)
+        if voice is not None:
+            _voice_cache.move_to_end(voice_name)
+            return voice
+
+        model_path = VOICES[voice_name]
+        voice = PiperVoice.load(str(model_path), use_cuda=False)
+        _voice_cache[voice_name] = voice
+        _voice_cache.move_to_end(voice_name)
+
+        while len(_voice_cache) > MODEL_CACHE_SIZE:
+            _voice_cache.popitem(last=False)
+
+        return voice
+
+
 @app.on_event("startup")
 async def validate_installation():
-    if not Path(PIPER_BIN).is_file():
-        raise RuntimeError(f"Piper executable not found at {PIPER_BIN}")
-
-    for voice, model_path in VOICES.items():
+    for voice_name, model_path in VOICES.items():
         config_path = Path(f"{model_path}.json")
         if not model_path.is_file():
-            raise RuntimeError(f"Model for voice '{voice}' is missing: {model_path}")
+            raise RuntimeError(f"Model for voice '{voice_name}' is missing: {model_path}")
         if not config_path.is_file():
-            raise RuntimeError(f"Config for voice '{voice}' is missing: {config_path}")
+            raise RuntimeError(f"Config for voice '{voice_name}' is missing: {config_path}")
 
+    # Preload the default voice so the first normal request avoids model loading.
+    # Run blocking model initialization off the event loop.
+    await asyncio.to_thread(get_voice, "ryan")
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -60,111 +84,201 @@ async def root():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#0b1020">
-<title>Kelku TTS · Text to Speech</title>
+<meta name="theme-color" content="#080d1b">
+<title>Kelku TTS</title>
 <style>
-:root{color-scheme:dark;--bg:#080c18;--panel:#11182a;--panel2:#151f35;--line:#26324b;--text:#f4f7ff;--muted:#9aa8c2;--accent:#8b9dff;--accent2:#67e8d1;--danger:#ff9a9a}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 15% 0%,#172344 0,transparent 42%),radial-gradient(ellipse at 100% 15%,#153b42 0,transparent 28%),var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
-.wrap{width:min(1080px,92%);margin:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:26px 0}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:20px;letter-spacing:-.5px}.logo{display:grid;place-items:center;width:42px;height:42px;border-radius:14px;background:linear-gradient(135deg,#a5b4fc,#5eead4);color:#07111e;font-size:21px;box-shadow:0 8px 30px #67e8d133}.badge{font-size:12px;color:#b7c4dc;border:1px solid var(--line);padding:7px 11px;border-radius:999px}.hero{padding:54px 0 32px;max-width:760px}.eyebrow{color:var(--accent2);font-size:12px;font-weight:800;letter-spacing:2px;text-transform:uppercase}.hero h1{font-size:clamp(38px,6vw,66px);line-height:1.02;letter-spacing:-2.7px;margin:17px 0}.hero h1 span{background:linear-gradient(90deg,#c7d2fe,#67e8d1);color:transparent;background-clip:text}.hero p{color:var(--muted);font-size:17px;line-height:1.7;max-width:650px;margin:0}
-.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr);gap:20px;margin:24px 0 60px}.card{background:linear-gradient(180deg,#121a2c,#0e1525);border:1px solid var(--line);border-radius:24px;padding:25px;box-shadow:0 20px 70px #0002}.card h2{font-size:19px;margin:0 0 8px;letter-spacing:-.4px}.sub{font-size:13px;color:var(--muted);line-height:1.6;margin:0 0 22px}.label{display:block;font-size:13px;color:#d5def0;font-weight:650;margin:18px 0 9px}textarea,select{width:100%;background:#0a1020;border:1px solid #34415d;border-radius:12px;color:var(--text);font:inherit;padding:14px;outline:none}textarea{min-height:150px;resize:vertical;line-height:1.55}textarea:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px #8b9dff22}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.counter{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:7px}.btn{border:0;border-radius:12px;padding:13px 17px;font:inherit;font-weight:750;cursor:pointer;transition:transform .15s,opacity .15s}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.55;cursor:wait;transform:none}.primary{width:100%;margin-top:20px;background:linear-gradient(100deg,#a5b4fc,#67e8d1);color:#07111e}.secondary{background:#1a2540;color:#e5eaff;border:1px solid #34415d}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.status{font-size:13px;color:var(--muted);margin-top:14px;min-height:20px}.status.error{color:var(--danger)}.player{margin-top:19px;padding:15px;border:1px solid var(--line);border-radius:15px;background:#0a1020}.player audio{width:100%;margin-top:10px}.hidden{display:none}.voice-list{display:grid;gap:10px;margin-top:18px}.voice{padding:13px;border:1px solid var(--line);border-radius:14px;background:#0d1424;display:flex;align-items:center;gap:12px}.voice-icon{width:38px;height:38px;display:grid;place-items:center;border-radius:12px;background:#202d49;font-size:18px}.voice strong{display:block;font-size:13px}.voice small{display:block;color:var(--muted);font-size:12px;margin-top:4px}.pill{margin-left:auto;font-size:10px;color:#a7f3d0;background:#12352f;padding:5px 7px;border-radius:999px}.info{margin-top:20px;padding:16px;border-radius:14px;background:#121d31;color:var(--muted);font-size:12px;line-height:1.7}.footer{display:flex;justify-content:space-between;gap:15px;flex-wrap:wrap;border-top:1px solid var(--line);padding:22px 0 30px;color:var(--muted);font-size:12px}.footer a,.api-link{color:#c6d0ff;text-decoration:none}.footer a:hover,.api-link:hover{text-decoration:underline}
-@media(max-width:760px){.hero{padding-top:35px}.grid{grid-template-columns:1fr}.card{padding:20px}.row{grid-template-columns:1fr}.nav{padding:18px 0}.hero h1{letter-spacing:-1.7px}}
+:root{color-scheme:dark;--bg:#080d1b;--panel:#10192b;--panel-hi:#14213a;--line:#273652;--text:#f4f7ff;--muted:#91a1bf;--blue:#a5b4fc;--mint:#67e8d1;--red:#ff9ca8}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 12% 0%,#1a2b50 0,transparent 38%),radial-gradient(ellipse at 100% 24%,#10343b 0,transparent 26%),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;letter-spacing:-.01em}
+button,select,textarea{font:inherit}
+.shell{width:min(860px,calc(100% - 36px));margin:0 auto}
+.topbar{height:86px;display:flex;align-items:center;justify-content:space-between;animation:fade-up .55s both}
+.brand{display:flex;align-items:center;gap:11px;font-weight:780;font-size:19px;letter-spacing:-.6px}
+.mark{display:grid;place-items:center;width:37px;height:37px;border-radius:12px;background:linear-gradient(140deg,var(--blue),var(--mint));color:#07111c;font-size:20px;box-shadow:0 7px 25px #67e8d122}
+.api{font-size:12px;color:#aebce0;text-decoration:none;border:1px solid var(--line);padding:8px 11px;border-radius:10px;transition:background .2s,border-color .2s,color .2s}
+.api:hover{background:#17243d;border-color:#52658a;color:white}
+main{padding:38px 0 70px}
+.workspace{display:grid;grid-template-columns:1fr;gap:16px;animation:fade-up .65s .06s both}
+.card{background:linear-gradient(155deg,#121d31f5,#0d1525f7);border:1px solid #2a3955;border-radius:22px;padding:24px;box-shadow:0 25px 80px #0002;transition:border-color .25s,transform .25s,box-shadow .25s}
+.card:focus-within{border-color:#536b98;box-shadow:0 25px 80px #0003,0 0 0 1px #8b9dff12}
+.controls{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
+.field-label{display:block;font-size:12px;font-weight:700;color:#b6c4df;margin:0 0 9px 2px;letter-spacing:.04em}
+select,textarea{width:100%;background:#090f1e;border:1px solid #2c3b58;border-radius:13px;color:var(--text);outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+select{height:48px;padding:0 14px;cursor:pointer}
+textarea{display:block;min-height:205px;resize:vertical;margin-top:15px;padding:17px 16px;font-size:15px;line-height:1.8;letter-spacing:0}
+select:focus,textarea:focus{border-color:#8799e9;box-shadow:0 0 0 3px #8b9dff1a;background:#0b1324}
+textarea::placeholder{color:#647491}
+.text-meta{display:flex;justify-content:space-between;gap:12px;margin:9px 2px 0;color:#7585a3;font-size:11px}
+.primary{height:48px;padding:0 19px;border:0;border-radius:13px;background:linear-gradient(110deg,#b4bfff,#6ce8d2);color:#07111d;font-weight:800;white-space:nowrap;cursor:pointer;box-shadow:0 8px 24px #8b9dff1c;transition:transform .2s,filter .2s,box-shadow .2s}
+.primary:hover:not(:disabled){transform:translateY(-2px);filter:brightness(1.06);box-shadow:0 12px 28px #8b9dff30}
+.primary:active:not(:disabled){transform:translateY(0) scale(.985)}
+.primary:disabled{cursor:wait;opacity:.72}
+.result{margin-top:17px;padding:16px;border:1px solid var(--line);border-radius:15px;background:#0a1120;animation:fade-up .35s both}
+.result-top{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}
+.state{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:700;color:#dce5fb}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 13px #67e8d188}
+.actions{display:flex;gap:8px;align-items:center}
+.small-btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:0 11px;border:1px solid #344563;border-radius:10px;background:#16223a;color:#eaf0ff;text-decoration:none;font-size:12px;font-weight:700;cursor:pointer;transition:transform .2s,background .2s,border-color .2s}
+.small-btn:hover{transform:translateY(-1px);background:#202f4d;border-color:#5b6f96}
+.wave{height:32px;display:flex;align-items:center;justify-content:center;gap:4px;margin:4px 0 12px}
+.wave i{display:block;width:3px;height:7px;border-radius:4px;background:linear-gradient(var(--blue),var(--mint));opacity:.65;transform-origin:center;animation:wave 1s ease-in-out infinite;animation-play-state:paused}
+.is-busy .wave i,.is-playing .wave i{animation-play-state:running}
+.wave i:nth-child(3n){animation-delay:-.55s}.wave i:nth-child(3n + 1){animation-delay:-.25s}.wave i:nth-child(4n){animation-delay:-.75s}
+.sentences{display:grid;gap:5px;max-height:180px;overflow:auto;padding:2px 2px 2px 0}
+.sentence{border-radius:9px;padding:8px 10px;color:#7f90af;font-size:12px;line-height:1.55;border:1px solid transparent;transition:background .25s,color .25s,border-color .25s,transform .25s}
+.sentence.active{color:#f4f7ff;background:#182640;border-color:#344a70;transform:translateX(2px)}
+.sentence.done{color:#9eebdc}
+.status{min-height:17px;margin:11px 2px 0;color:#8191ad;font-size:12px}
+.status.error{color:var(--red)}
+audio{display:none}
+.hidden{display:none!important}
+.footer{padding:0 0 28px;display:flex;justify-content:space-between;gap:10px;color:#647491;font-size:11px;animation:fade-up .7s .1s both}
+@keyframes fade-up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes wave{0%,100%{height:6px;opacity:.5}50%{height:27px;opacity:1}}
+@media(max-width:620px){.shell{width:min(100% - 22px,860px)}.topbar{height:72px}.brand{font-size:17px}.mark{width:34px;height:34px}main{padding:22px 0 48px}.card{padding:17px;border-radius:18px}.controls{grid-template-columns:1fr}.primary{width:100%}textarea{min-height:190px}.result-top{align-items:flex-start;flex-direction:column}.actions{width:100%}.small-btn{flex:1}.footer{flex-wrap:wrap}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
 </style>
 </head>
 <body>
-<div class="wrap">
-<header class="nav">
-  <div class="brand"><div class="logo">♫</div><span>Kelku TTS</span></div>
-  <a class="badge api-link" href="/docs">API documentation ↗</a>
+<div class="shell">
+<header class="topbar">
+  <div class="brand"><span class="mark">♫</span><span>Kelku TTS</span></div>
+  <a class="api" href="/docs">API ↗</a>
 </header>
 <main>
-  <section class="hero">
-    <div class="eyebrow">Text to speech · Powered by Piper</div>
-    <h1>Give your words<br><span>a voice.</span></h1>
-    <p>Generate natural-sounding speech in English or Malayalam. Choose a voice, enter your text, and listen or download the audio.</p>
-  </section>
-  <section class="grid">
-    <div class="card">
-      <h2>Create speech</h2>
-      <p class="sub">Your text is converted into a WAV audio file by the Kelku TTS API.</p>
-      <form id="ttsForm">
-        <label class="label" for="text">Text to speak</label>
-        <textarea id="text" maxlength="2000" placeholder="Type something you want to hear..." required>Hello, welcome to Kelku TTS.</textarea>
-        <div class="counter"><span>Maximum 2,000 characters</span><span id="count">34 / 2000</span></div>
-        <div class="row">
-          <div><label class="label" for="voice">Voice</label>
-            <select id="voice">
-              <option value="ryan">Ryan · English US</option>
-              <option value="hfc_male">HFC Male · English US</option>
-              <option value="libritts_r">LibriTTS R · English US</option>
-              <option value="arjun">Arjun · Malayalam</option>
-            </select>
-          </div>
-          <div><label class="label" for="format">Output</label><select id="format" disabled><option>WAV audio</option></select></div>
+<section class="workspace">
+  <div class="card">
+    <form id="ttsForm">
+      <div class="controls">
+        <div>
+          <label class="field-label" for="voice">VOICE</label>
+          <select id="voice">
+            <option value="ryan">Ryan · English (US)</option>
+            <option value="hfc_male">HFC Male · English (US)</option>
+            <option value="libritts_r">LibriTTS R · English (US)</option>
+            <option value="arjun">Arjun · Malayalam</option>
+          </select>
         </div>
-        <button class="btn primary" id="generate" type="submit">✦ Generate speech</button>
-        <div id="status" class="status" role="status" aria-live="polite"></div>
-        <div id="playerBox" class="player hidden">
-          <strong>🎧 Your audio is ready</strong>
-          <audio id="audio" controls></audio>
-          <div class="actions"><a id="download" class="btn secondary" download="kelku-speech.wav" style="text-decoration:none">Download WAV ↓</a><button class="btn secondary" id="reset" type="button">Clear audio</button></div>
-        </div>
-      </form>
-    </div>
-    <aside class="card">
-      <h2>Choose your voice</h2>
-      <p class="sub">Four voices, two languages. Switch voices any time.</p>
-      <div class="voice-list">
-        <div class="voice"><div class="voice-icon">🎙️</div><div><strong>Ryan</strong><small>English · US · Medium</small></div><span class="pill">DEFAULT</span></div>
-        <div class="voice"><div class="voice-icon">🗣️</div><div><strong>HFC Male</strong><small>English · US · Medium</small></div></div>
-        <div class="voice"><div class="voice-icon">📖</div><div><strong>LibriTTS R</strong><small>English · US · Medium</small></div></div>
-        <div class="voice"><div class="voice-icon">🇮🇳</div><div><strong>Arjun</strong><small>Malayalam · Medium</small></div></div>
+        <button class="primary" id="generate" type="submit">▶ &nbsp; Generate &amp; play</button>
       </div>
-      <div class="info"><strong style="color:#e5eaff">A quick note</strong><br>Free hosting can take a little longer to respond after inactivity. Keep this page open while your first request wakes the service.</div>
-    </aside>
-  </section>
+      <label class="field-label" for="text" style="margin-top:22px">TEXT</label>
+      <textarea id="text" maxlength="2000" placeholder="Type or paste text…" required>Hello, welcome to Kelku TTS.</textarea>
+      <div class="text-meta"><span id="count">0 / 2000</span><span>Sentence-by-sentence playback</span></div>
+    </form>
+    <div id="result" class="result hidden">
+      <div class="result-top">
+        <div class="state"><span class="dot"></span><span id="resultLabel">Ready to play</span></div>
+        <div class="actions">
+          <a id="download" class="small-btn" download="kelku-speech.wav">↓ Download current</a>
+          <button id="clear" class="small-btn" type="button">Clear</button>
+        </div>
+      </div>
+      <div class="wave" id="wave" aria-label="Audio activity animation"></div>
+      <div id="sentences" class="sentences" aria-live="polite"></div>
+      <audio id="audio" preload="auto"></audio>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+  </div>
+</section>
 </main>
-<footer class="footer"><span>© <span id="year"></span> Kelku TTS · Built with FastAPI + Piper</span><span><a href="/docs">API docs</a> &nbsp;·&nbsp; <a href="/openapi.json">OpenAPI schema</a></span></footer>
+<footer class="footer"><span>Kelku TTS</span><span>Powered by Piper</span></footer>
 </div>
 <script>
-const textEl=document.getElementById('text'), countEl=document.getElementById('count');
-const form=document.getElementById('ttsForm'), button=document.getElementById('generate');
-const statusEl=document.getElementById('status'), playerBox=document.getElementById('playerBox');
-const audio=document.getElementById('audio'), download=document.getElementById('download');
-let currentUrl=null;
-document.getElementById('year').textContent=new Date().getFullYear();
-function updateCount(){countEl.textContent=`${textEl.value.length} / 2000`}
+const $=id=>document.getElementById(id);
+const textEl=$('text'),voiceEl=$('voice'),button=$('generate'),statusEl=$('status');
+const result=$('result'),audio=$('audio'),download=$('download'),sentencesEl=$('sentences'),wave=$('wave');
+let runId=0,urls=[],chunks=[],activeIndex=-1,downloadUrl=null,isRunning=false;
+for(let i=0;i<30;i++){const bar=document.createElement('i');wave.appendChild(bar)}
+function updateCount(){$('count').textContent=`${textEl.value.length} / 2000`}
 textEl.addEventListener('input',updateCount);updateCount();
-document.getElementById('voice').addEventListener('change',e=>{
-  if(e.target.value==='arjun' && !textEl.value.trim()) textEl.value='നമസ്കാരം';
-});
-form.addEventListener('submit',async e=>{
-  e.preventDefault();
-  const text=textEl.value.trim(), voice=document.getElementById('voice').value;
-  if(!text){statusEl.textContent='Enter some text first.';statusEl.className='status error';return}
-  button.disabled=true;button.textContent='Generating audio…';statusEl.className='status';statusEl.textContent='Generating speech. The first request may take longer on free hosting.';
-  playerBox.classList.add('hidden');
-  try{
-    const params=new URLSearchParams({text,voice});
-    const response=await fetch(`/generate?${params.toString()}`);
-    if(!response.ok){
-      let message=`Request failed (${response.status})`;
-      try{const data=await response.json();message=data.detail||message}catch{}
-      throw new Error(message);
+function splitSentences(text){
+  const lines=text.split(/
++/).map(s=>s.trim()).filter(Boolean);
+  const result=[];
+  for(const line of lines){
+    const parts=line.match(/[^.!?。！？]+(?:[.!?。！？]+["'”’)\]]*|$)/g)||[line];
+    for(const part of parts){const clean=part.trim();if(clean)result.push(clean)}
+  }
+  return result;
+}
+function cleanupUrls(){for(const url of urls)URL.revokeObjectURL(url);urls=[];if(downloadUrl){URL.revokeObjectURL(downloadUrl);downloadUrl=null}}
+function stopPlayback(){audio.pause();audio.removeAttribute('src');audio.load();isRunning=false;result.classList.remove('is-busy','is-playing');}
+function setActive(index){
+  activeIndex=index;
+  [...sentencesEl.children].forEach((node,i)=>{node.classList.toggle('active',i===index);if(i<index)node.classList.add('done');else node.classList.remove('done')});
+  const current=chunks[index];
+  if(current){$('resultLabel').textContent=`Sentence ${index+1} of ${chunks.length}`;if(current.url)download.href=current.url;sentencesEl.children[index]?.scrollIntoView({block:'nearest',behavior:'smooth'})}
+}
+function clearResult(){
+  runId++;stopPlayback();cleanupUrls();chunks=[];activeIndex=-1;sentencesEl.replaceChildren();result.classList.add('hidden');statusEl.textContent='';statusEl.className='status';button.disabled=false;button.textContent='▶  Generate & play';
+}
+async function fetchChunk(text,voice,token){
+  const params=new URLSearchParams({text,voice});
+  const response=await fetch(`/generate?${params}`,{signal:controller.signal});
+  if(!response.ok){let msg=`Generation failed (${response.status})`;try{msg=(await response.json()).detail||msg}catch{};throw new Error(msg)}
+  const blob=await response.blob();if(!blob.size)throw new Error('Empty audio response');
+  if(token!==runId)throw new DOMException('Cancelled','AbortError');
+  const url=URL.createObjectURL(blob);urls.push(url);return url;
+}
+function ensureChunk(item,voice,token){
+  if(item.url)return Promise.resolve(item.url);
+  if(!item.promise)item.promise=fetchChunk(item.text,voice,token).then(url=>(item.url=url,url));
+  return item.promise;
+}
+let controller=null;
+async function playChunk(index,token){
+  if(token!==runId)return;
+  while(index<chunks.length&&token===runId){
+    const item=chunks[index];
+    if(!item.url){
+      $('resultLabel').textContent=`Generating ${index+1} of ${chunks.length}…`;
+      result.classList.add('is-busy');
+      try{item.url=await ensureChunk(item,voiceEl.value,token)}
+      catch(error){if(error.name==='AbortError')return;throw error}
     }
-    const blob=await response.blob();
-    if(!blob.size)throw new Error('The API returned an empty audio file.');
-    if(currentUrl)URL.revokeObjectURL(currentUrl);
-    currentUrl=URL.createObjectURL(blob);audio.src=currentUrl;download.href=currentUrl;download.download=`kelku-${voice}.wav`;
-    playerBox.classList.remove('hidden');statusEl.textContent='Audio generated successfully.';
-    try{await audio.play()}catch{}
-  }catch(err){statusEl.textContent=err.message||'Could not generate speech. Please try again.';statusEl.className='status error'}
-  finally{button.disabled=false;button.textContent='✦ Generate speech'}
+    if(token!==runId)return;
+    setActive(index);result.classList.remove('is-busy');result.classList.add('is-playing');
+    audio.src=item.url;download.href=item.url;download.download=`kelku-${voiceEl.value}-sentence-${index+1}.wav`;
+    try{await audio.play()}catch(error){if(error.name==='NotAllowedError'){statusEl.textContent='Press play on the audio control to continue.';throw error}throw error}
+    await new Promise((resolve,reject)=>{
+      const ended=()=>{cleanup();resolve()},failed=()=>{cleanup();reject(new Error('Audio playback failed'))};
+      const cleanup=()=>{audio.removeEventListener('ended',ended);audio.removeEventListener('error',failed);audio.removeEventListener('pause',paused)};
+      const paused=()=>{if(!isRunning){cleanup();resolve()}};
+      audio.addEventListener('ended',ended,{once:true});audio.addEventListener('error',failed,{once:true});audio.addEventListener('pause',paused,{once:true});
+    });
+    if(token!==runId)return;
+    index++;
+  }
+  if(token===runId){result.classList.remove('is-busy','is-playing');$('resultLabel').textContent='Playback complete';statusEl.textContent='';button.disabled=false;button.textContent='▶  Play again'}
+}
+$('ttsForm').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const token=++runId; if(controller)controller.abort();controller=new AbortController();stopPlayback();cleanupUrls();
+  const text=textEl.value.trim(),voice=voiceEl.value;
+  if(!text){statusEl.textContent='Enter text first.';statusEl.className='status error';return}
+  chunks=splitSentences(text).map(text=>({text,url:null}));
+  if(!chunks.length){statusEl.textContent='Enter text first.';statusEl.className='status error';return}
+  sentencesEl.replaceChildren();
+  chunks.forEach((item,index)=>{const node=document.createElement('div');node.className='sentence';node.textContent=item.text;node.dataset.index=index;sentencesEl.appendChild(node)});
+  result.classList.remove('hidden');result.classList.add('is-busy');statusEl.className='status';statusEl.textContent='';
+  button.disabled=true;button.textContent='Generating…';$('resultLabel').textContent=`Preparing ${chunks.length} sentence${chunks.length===1?'':'s'}…`;
+  // Fetch the next chunk in the background while the current sentence plays.
+  let producerError=null,producerDone=false;
+  const producer=(async()=>{try{for(let i=0;i<chunks.length;i++){if(token!==runId)return;await ensureChunk(chunks[i],voice,token)}}catch(error){if(error.name!=='AbortError')producerError=error}finally{producerDone=true}})();
+  try{
+    // The first chunk is played as soon as it is ready; later chunks are prefetched concurrently.
+    await playChunk(0,token);
+    await producer;
+    if(producerError&&token===runId)throw producerError;
+  }catch(error){
+    if(error.name!=='AbortError'&&token===runId){statusEl.textContent=error.message||'Could not generate speech.';statusEl.className='status error';$('resultLabel').textContent='Could not complete';result.classList.remove('is-busy','is-playing');button.disabled=false;button.textContent='↻ Try again'}
+  }finally{
+    if(token===runId){button.disabled=false;if($('resultLabel').textContent!=='Playback complete')button.textContent='▶  Play again'}
+  }
 });
-document.getElementById('reset').addEventListener('click',()=>{
-  audio.pause();audio.removeAttribute('src');audio.load();playerBox.classList.add('hidden');
-  if(currentUrl){URL.revokeObjectURL(currentUrl);currentUrl=null}
-  statusEl.textContent='';
-});
+audio.addEventListener('play',()=>result.classList.add('is-playing'));
+audio.addEventListener('ended',()=>result.classList.remove('is-playing'));
+$('clear').addEventListener('click',clearResult);
 </script>
 </body>
 </html>"""
@@ -184,60 +298,39 @@ async def generate_speech(
     if not text:
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    model_path = VOICES[voice]
-    temp = tempfile.NamedTemporaryFile(
-        prefix="kelku_tts_", suffix=".wav", dir="/tmp", delete=False
-    )
-    wav_path = Path(temp.name)
-    temp.close()
+    started = time.perf_counter()
 
     try:
-        async with generation_semaphore:
-            process = await asyncio.create_subprocess_exec(
-                PIPER_BIN,
-                "--model", str(model_path),
-                "--output_file", str(wav_path),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(
-                    process.communicate(input=(text + "\n").encode("utf-8")),
-                    timeout=GENERATION_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                raise HTTPException(
-                    status_code=504,
-                    detail="Speech generation timed out. Try shorter text.",
-                )
-
-        if process.returncode != 0:
-            error = stderr.decode("utf-8", errors="replace")[-1500:]
-            raise HTTPException(
-                status_code=500,
-                detail=f"Piper failed to generate audio: {error}",
-            )
-
-        if not wav_path.is_file() or wav_path.stat().st_size == 0:
-            raise HTTPException(status_code=500, detail="Piper returned an empty audio file.")
-
-        return FileResponse(
-            path=str(wav_path),
-            media_type="audio/wav",
-            filename=f"kelku_{voice}.wav",
-            headers={"Cache-Control": "no-store"},
-            background=BackgroundTask(lambda: wav_path.unlink(missing_ok=True)),
-        )
-
-    except HTTPException:
-        wav_path.unlink(missing_ok=True)
-        raise
+        # Piper's ONNX model stays loaded between requests. Audio is assembled
+        # in memory, avoiding process startup and temporary-file disk I/O.
+        wav_bytes = await asyncio.to_thread(synthesize_wav_bytes, text, voice)
     except Exception as exc:
-        wav_path.unlink(missing_ok=True)
         raise HTTPException(
             status_code=500,
-            detail="Internal speech generation error.",
+            detail="Speech generation failed. Check the Render service logs.",
         ) from exc
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": f'inline; filename="kelku-{voice}.wav"',
+            "Cache-Control": "no-store",
+            "X-TTS-Generation-Ms": str(elapsed_ms),
+            "X-TTS-Voice": voice,
+        },
+    )
+
+
+def synthesize_wav_bytes(text: str, voice_name: str) -> bytes:
+    # Serialize inference to avoid CPU oversubscription on small free instances.
+    # Model loading and synthesis share the lock so the cache cannot evict a
+    # model while another request is using it.
+    with _inference_lock:
+        voice = get_voice(voice_name)
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file)
+        return output.getvalue()
+

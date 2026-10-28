@@ -89,3 +89,20 @@ Then open `http://localhost:10000/docs`.
 - The service starts a Piper subprocess per request. It is a simple baseline, not a persistent-model ultra-low-latency implementation.
 - Voice model licenses vary. Review each voice's model card before commercial use.
 - The Docker build uses a versioned Piper release URL and the `main` branch of the voice repository. For reproducible builds, verify the release asset and pin the model repository to a specific commit.
+
+
+## Speed-optimized version
+
+This version uses Piper's Python API instead of starting a Piper subprocess for every request. It keeps recently used ONNX model sessions in an in-memory LRU cache, preloads Ryan at startup, synthesizes WAV data in memory, and returns `X-TTS-Generation-Ms` to help measure request generation time.
+
+The cache defaults to two loaded voices to balance repeat-request speed against Render Free memory limits. If the service restarts or a voice is evicted from the cache, its next request must load that model again. To tune the cache, set `PIPER_MODEL_CACHE_SIZE` in the Dockerfile or Render environment. Do not set it to 4 on Render Free without checking memory usage; the instance may run out of RAM.
+
+## Measuring performance
+
+Check the `X-TTS-Generation-Ms` response header in browser developer tools or with curl. The first request to a voice can be slower than warm requests. Render Free also spins down after 15 minutes without inbound traffic, and wake-up delay is separate from speech synthesis.
+
+This design removes repeated process creation and temporary WAV file I/O. It cannot guarantee instant speech: Piper still performs CPU inference, and Render Free has limited CPU/RAM. For consistently low latency, use a host with sufficient dedicated CPU/RAM and an always-on instance.
+
+## UI behavior
+
+The web UI is intentionally minimal. Text is split into sentences (newlines are also treated as boundaries), and each sentence is requested from the existing `/generate` endpoint. Audio chunks are prefetched in the background and played in order; the active sentence is highlighted as it plays. Download saves the currently selected sentence's WAV file.

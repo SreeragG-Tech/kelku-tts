@@ -2,7 +2,10 @@ FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    PIPER_MODEL_CACHE_SIZE=2
 
 WORKDIR /app
 
@@ -11,20 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     espeak-ng \
     libgomp1 \
-    tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Piper's prebuilt Linux x86-64 release.
-RUN mkdir -p /opt/piper && \
-    curl -fL --retry 3 \
-      https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz \
-      -o /tmp/piper.tar.gz && \
-    tar -xzf /tmp/piper.tar.gz -C /opt/piper && \
-    rm /tmp/piper.tar.gz && \
-    PIPER_BIN="$(find /opt/piper -type f -name piper -perm /111 | head -n 1)" && \
-    test -n "$PIPER_BIN" && \
-    ln -s "$PIPER_BIN" /usr/local/bin/piper && \
-    /usr/local/bin/piper --help >/dev/null
+# Install Piper's Python API so ONNX models can remain loaded between requests.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Download exactly the four requested ONNX models and matching JSON files.
 RUN set -eux; \
@@ -39,10 +33,7 @@ RUN set -eux; \
     curl -fL --retry 3 "$BASE/ml/ml_IN/arjun/medium/ml_IN-arjun-medium.onnx" -o /app/models/ml_IN-arjun-medium.onnx; \
     curl -fL --retry 3 "$BASE/ml/ml_IN/arjun/medium/ml_IN-arjun-medium.onnx.json" -o /app/models/ml_IN-arjun-medium.onnx.json
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
 COPY app.py .
 
-# Render provides PORT, usually 10000. The shell expands it at runtime.
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+EXPOSE 10000
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1"]
