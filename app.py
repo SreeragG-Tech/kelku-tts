@@ -163,7 +163,7 @@ audio{display:none}
       </div>
       <label class="field-label" for="text" style="margin-top:22px">TEXT</label>
       <div id="text" class="editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="Type or paste text…">Hello, welcome to Kelku TTS.</div>
-      <div class="text-meta"><span id="count">0 / 2000</span><span>Sentence-by-sentence playback</span></div>
+      <div class="text-meta"><span id="count">0 / 2000</span><span>Buffered chunk playback</span></div>
     </form>
     <div id="result" class="result hidden">
       <div class="result-top">
@@ -222,7 +222,8 @@ function updateCount() {
 
 function splitSentences(text) {
   return text
-    .split(/(?<=[.!?。！？])\s+|\n+/u)
+    // Retain punctuation with each smaller chunk; newlines are also boundaries.
+    .split(/(?<=[.!?,;:。！？，；：])\s*|\n+/u)
     .map(part => part.trim())
     .filter(Boolean);
 }
@@ -259,7 +260,7 @@ function setActive(index) {
   });
   const current = chunks[index];
   if (current) {
-    $('resultLabel').textContent = `Sentence ${index + 1} of ${chunks.length}`;
+    $('resultLabel').textContent = `Chunk ${index + 1} of ${chunks.length}`;
     if (current.url) {
       download.href = current.url;
       download.download = `kelku-${voiceEl.value}-sentence-${index + 1}.wav`;
@@ -354,40 +355,79 @@ function waitForAudioEnd(token) {
 
 async function runPlayback(token, voice, signal) {
   let failedChunks = 0;
+  let nextToFetch = 0;
+  let nextToPlay = 0;
+  const concurrency = 3;
+
+  // Keep a few chunks in flight. fetchChunk caches each promise to avoid duplicate calls.
+  const queuePrefetch = () => {
+    while (
+      nextToFetch < chunks.length &&
+      nextToFetch < nextToPlay + concurrency &&
+      !signal.aborted &&
+      token === runId
+    ) {
+      const item = chunks[nextToFetch++];
+      fetchChunk(item, voice, token, signal).catch(error => {
+        if (error.name !== 'AbortError') console.error('Chunk prefetch failed:', error);
+      });
+    }
+  };
+
+  const getOutcome = async index => {
+    try {
+      return await fetchChunk(chunks[index], voice, token, signal);
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      return { url: null, error };
+    }
+  };
+
+  // Wait until two chunks have completed successfully, or all chunks are ready
+  // when the input contains fewer than two chunks.
+  queuePrefetch();
+  let readyCount = 0;
+  let scanIndex = 0;
+  while (scanIndex < chunks.length && readyCount < Math.min(2, chunks.length)) {
+    if (token !== runId || signal.aborted) return;
+    const outcome = await getOutcome(scanIndex);
+    if (outcome.error || !outcome.url) {
+      chunks[scanIndex].failed = true;
+      chunks[scanIndex].error = outcome.error;
+      failedChunks++;
+    } else {
+      readyCount++;
+    }
+    scanIndex++;
+    queuePrefetch();
+  }
+
+  if (token !== runId || signal.aborted) return;
 
   for (let index = 0; index < chunks.length; index++) {
     if (token !== runId || signal.aborted) return;
+    nextToPlay = index;
+    queuePrefetch();
 
-    $('resultLabel').textContent = `Generating ${index + 1} of ${chunks.length}…`;
-    result.classList.add('is-busy');
-
+    const item = chunks[index];
     let outcome;
-    try {
-      outcome = await fetchChunk(chunks[index], voice, token, signal);
-    } catch (error) {
-      if (error.name === 'AbortError') return;
-      outcome = { url: null, error };
+    if (item.failed) {
+      outcome = { url: null, error: item.error || new Error('Chunk generation failed.') };
+    } else {
+      outcome = await getOutcome(index);
     }
 
     if (token !== runId || signal.aborted) return;
 
     if (outcome.error || !outcome.url) {
-      failedChunks++;
-      const shortError = outcome.error?.message || 'Unknown generation error';
-      statusEl.textContent = `Sentence ${index + 1} skipped: ${shortError}`;
+      if (!item.failed) failedChunks++;
+      item.failed = true;
+      statusEl.textContent = `Chunk ${index + 1} skipped: ${outcome.error?.message || 'Generation failed'}`;
       statusEl.className = 'status error';
-      chunks[index].failed = true;
       setActive(index);
-      // Continue to the next sentence rather than failing the entire queue.
+      nextToFetch = Math.max(nextToFetch, index + 1);
+      queuePrefetch();
       continue;
-    }
-
-    // Start fetching only the next sentence now. It runs while this chunk plays.
-    // The next loop iteration reuses the same in-flight promise.
-    if (index + 1 < chunks.length) {
-      fetchChunk(chunks[index + 1], voice, token, signal).catch(error => {
-        if (error.name !== 'AbortError') console.error('Prefetch failed:', error);
-      });
     }
 
     setActive(index);
@@ -395,7 +435,7 @@ async function runPlayback(token, voice, signal) {
     result.classList.add('is-playing');
     audio.src = outcome.url;
     download.href = outcome.url;
-    download.download = `kelku-${voice}-sentence-${index + 1}.wav`;
+    download.download = `kelku-${voice}-chunk-${index + 1}.wav`;
 
     try {
       await audio.play();
@@ -403,11 +443,13 @@ async function runPlayback(token, voice, signal) {
     } catch (error) {
       if (token !== runId || signal.aborted || error.name === 'AbortError') return;
       failedChunks++;
-      statusEl.textContent = `Sentence ${index + 1} playback failed. Skipping to the next sentence.`;
+      statusEl.textContent = `Chunk ${index + 1} playback failed. Skipping to the next chunk.`;
       statusEl.className = 'status error';
     }
 
     if (token !== runId || signal.aborted) return;
+    nextToPlay = index + 1;
+    queuePrefetch();
   }
 
   if (token === runId && !signal.aborted) {
@@ -417,7 +459,7 @@ async function runPlayback(token, voice, signal) {
     button.disabled = false;
     button.textContent = '▶  Generate & play';
     $('resultLabel').textContent = failedChunks
-      ? `Playback finished · ${failedChunks} sentence${failedChunks === 1 ? '' : 's'} skipped`
+      ? `Playback finished · ${failedChunks} chunk${failedChunks === 1 ? '' : 's'} skipped`
       : 'Playback complete';
     if (!failedChunks) {
       statusEl.textContent = '';
@@ -480,7 +522,7 @@ $('ttsForm').addEventListener('submit', async event => {
   button.disabled = true;
   button.textContent = 'Generating…';
   stopButton.classList.remove('hidden');
-  $('resultLabel').textContent = `Preparing ${chunks.length} sentence${chunks.length === 1 ? '' : 's'}…`;
+  $('resultLabel').textContent = `Buffering first ${Math.min(2, chunks.length)} chunk${chunks.length === 1 ? '' : 's'}…`;
 
   try {
     await runPlayback(token, voice, signal);
