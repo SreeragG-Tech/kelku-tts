@@ -103,10 +103,10 @@ main{padding:38px 0 70px}
 .card:focus-within{border-color:#536b98;box-shadow:0 25px 80px #0003,0 0 0 1px #8b9dff12}
 .controls{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
 .field-label{display:block;font-size:12px;font-weight:700;color:#b6c4df;margin:0 0 9px 2px;letter-spacing:.04em}
-select,textarea{width:100%;background:#090f1e;border:1px solid #2c3b58;border-radius:13px;color:var(--text);outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+select,textarea,.editor{width:100%;background:#090f1e;border:1px solid #2c3b58;border-radius:13px;color:var(--text);outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
 select{height:48px;padding:0 14px;cursor:pointer}
-textarea{display:block;min-height:205px;resize:vertical;margin-top:15px;padding:17px 16px;font-size:15px;line-height:1.8;letter-spacing:0}
-select:focus,textarea:focus{border-color:#8799e9;box-shadow:0 0 0 3px #8b9dff1a;background:#0b1324}
+.editor{display:block;min-height:205px;max-height:420px;overflow:auto;resize:vertical;margin-top:15px;padding:17px 16px;font-size:15px;line-height:1.8;letter-spacing:0;white-space:pre-wrap;overflow-wrap:anywhere;cursor:text}.editor:empty:before{content:attr(data-placeholder);color:#647491;pointer-events:none}.editor .active-sentence{background:#253b61;color:#fff;border-radius:4px;box-shadow:0 0 0 2px #253b61;transition:background .2s,color .2s}.editor .done-sentence{color:#9eebdc}
+select:focus,textarea:focus,.editor:focus{border-color:#8799e9;box-shadow:0 0 0 3px #8b9dff1a;background:#0b1324}
 textarea::placeholder{color:#647491}
 .text-meta{display:flex;justify-content:space-between;gap:12px;margin:9px 2px 0;color:#7585a3;font-size:11px}
 .primary{height:48px;padding:0 19px;border:0;border-radius:13px;background:linear-gradient(110deg,#b4bfff,#6ce8d2);color:#07111d;font-weight:800;white-space:nowrap;cursor:pointer;box-shadow:0 8px 24px #8b9dff1c;transition:transform .2s,filter .2s,box-shadow .2s}
@@ -135,7 +135,7 @@ audio{display:none}
 .footer{padding:0 0 28px;display:flex;justify-content:space-between;gap:10px;color:#647491;font-size:11px;animation:fade-up .7s .1s both}
 @keyframes fade-up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
 @keyframes wave{0%,100%{height:6px;opacity:.5}50%{height:27px;opacity:1}}
-@media(max-width:620px){.shell{width:min(100% - 22px,860px)}.topbar{height:72px}.brand{font-size:17px}.mark{width:34px;height:34px}main{padding:22px 0 48px}.card{padding:17px;border-radius:18px}.controls{grid-template-columns:1fr}.primary{width:100%}textarea{min-height:190px}.result-top{align-items:flex-start;flex-direction:column}.actions{width:100%}.small-btn{flex:1}.footer{flex-wrap:wrap}}
+@media(max-width:620px){.shell{width:min(100% - 22px,860px)}.topbar{height:72px}.brand{font-size:17px}.mark{width:34px;height:34px}main{padding:22px 0 48px}.card{padding:17px;border-radius:18px}.controls{grid-template-columns:1fr}.primary{width:100%}.editor{min-height:190px}.result-top{align-items:flex-start;flex-direction:column}.actions{width:100%}.small-btn{flex:1}.footer{flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
 </style>
 </head>
@@ -162,7 +162,7 @@ audio{display:none}
         <button class="primary" id="generate" type="submit">▶ &nbsp; Generate &amp; play</button>
       </div>
       <label class="field-label" for="text" style="margin-top:22px">TEXT</label>
-      <textarea id="text" maxlength="2000" placeholder="Type or paste text…" required>Hello, welcome to Kelku TTS.</textarea>
+      <div id="text" class="editor" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="Type or paste text…">Hello, welcome to Kelku TTS.</div>
       <div class="text-meta"><span id="count">0 / 2000</span><span>Sentence-by-sentence playback</span></div>
     </form>
     <div id="result" class="result hidden">
@@ -170,6 +170,7 @@ audio{display:none}
         <div class="state"><span class="dot"></span><span id="resultLabel">Ready to play</span></div>
         <div class="actions">
           <a id="download" class="small-btn" download="kelku-speech.wav">↓ Download current</a>
+          <button id="stop" class="small-btn hidden" type="button">■ Stop</button>
           <button id="clear" class="small-btn" type="button">Clear</button>
         </div>
       </div>
@@ -184,101 +185,334 @@ audio{display:none}
 <footer class="footer"><span>Kelku TTS</span><span>Powered by Piper</span></footer>
 </div>
 <script>
-const $=id=>document.getElementById(id);
-const textEl=$('text'),voiceEl=$('voice'),button=$('generate'),statusEl=$('status');
-const result=$('result'),audio=$('audio'),download=$('download'),sentencesEl=$('sentences'),wave=$('wave');
-let runId=0,urls=[],chunks=[],activeIndex=-1,downloadUrl=null,isRunning=false;
-for(let i=0;i<30;i++){const bar=document.createElement('i');wave.appendChild(bar)}
-function updateCount(){$('count').textContent=`${textEl.value.length} / 2000`}
-textEl.addEventListener('input',updateCount);updateCount();
-function splitSentences(text){
-  const lines=text.split(/
-+/).map(s=>s.trim()).filter(Boolean);
-  const result=[];
-  for(const line of lines){
-    const parts=line.match(/[^.!?。！？]+(?:[.!?。！？]+["'”’)\]]*|$)/g)||[line];
-    for(const part of parts){const clean=part.trim();if(clean)result.push(clean)}
+const $ = id => document.getElementById(id);
+const textEl = $('text');
+const voiceEl = $('voice');
+const button = $('generate');
+const stopButton = $('stop');
+const statusEl = $('status');
+const result = $('result');
+const audio = $('audio');
+const download = $('download');
+const sentencesEl = $('sentences');
+const wave = $('wave');
+
+let runId = 0;
+let controller = null;
+let urls = [];
+let chunks = [];
+let isRunning = false;
+let activeIndex = -1;
+
+for (let i = 0; i < 30; i++) {
+  const bar = document.createElement('i');
+  wave.appendChild(bar);
+}
+
+function editorText() {
+  return textEl.innerText.replace(/\u00a0/g, ' ').replace(/\r/g, '');
+}
+
+function updateCount() {
+  const text = editorText();
+  $('count').textContent = `${text.length} / 2000`;
+  if (text.length > 2000) statusEl.textContent = 'Maximum text length is 2000 characters.';
+  else if (!isRunning) statusEl.textContent = '';
+}
+
+function splitSentences(text) {
+  return text
+    .split(/(?<=[.!?。！？])\s+|\n+/u)
+    .map(part => part.trim())
+    .filter(Boolean);
+}
+
+function cleanupUrls() {
+  for (const url of urls) URL.revokeObjectURL(url);
+  urls = [];
+}
+
+function renderEditorChunks() {
+  textEl.replaceChildren();
+  chunks.forEach((chunk, index) => {
+    const span = document.createElement('span');
+    span.className = 'editor-sentence';
+    span.dataset.index = String(index);
+    span.textContent = chunk.text;
+    textEl.appendChild(span);
+    if (index < chunks.length - 1) {
+      const separator = document.createTextNode(' ');
+      textEl.appendChild(separator);
+    }
+  });
+}
+
+function setActive(index) {
+  activeIndex = index;
+  textEl.querySelectorAll('.editor-sentence').forEach((node, i) => {
+    node.classList.toggle('active-sentence', i === index);
+    node.classList.toggle('done-sentence', i < index);
+  });
+  [...sentencesEl.children].forEach((node, i) => {
+    node.classList.toggle('active', i === index);
+    node.classList.toggle('done', i < index);
+  });
+  const current = chunks[index];
+  if (current) {
+    $('resultLabel').textContent = `Sentence ${index + 1} of ${chunks.length}`;
+    if (current.url) {
+      download.href = current.url;
+      download.download = `kelku-${voiceEl.value}-sentence-${index + 1}.wav`;
+    }
+    const active = textEl.querySelector(`[data-index="${index}"]`);
+    active?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    sentencesEl.children[index]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
-  return result;
 }
-function cleanupUrls(){for(const url of urls)URL.revokeObjectURL(url);urls=[];if(downloadUrl){URL.revokeObjectURL(downloadUrl);downloadUrl=null}}
-function stopPlayback(){audio.pause();audio.removeAttribute('src');audio.load();isRunning=false;result.classList.remove('is-busy','is-playing');}
-function setActive(index){
-  activeIndex=index;
-  [...sentencesEl.children].forEach((node,i)=>{node.classList.toggle('active',i===index);if(i<index)node.classList.add('done');else node.classList.remove('done')});
-  const current=chunks[index];
-  if(current){$('resultLabel').textContent=`Sentence ${index+1} of ${chunks.length}`;if(current.url)download.href=current.url;sentencesEl.children[index]?.scrollIntoView({block:'nearest',behavior:'smooth'})}
+
+function stopRun(message = '') {
+  runId++;
+  if (controller) controller.abort();
+  controller = null;
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  isRunning = false;
+  result.classList.remove('is-busy', 'is-playing');
+  stopButton.classList.add('hidden');
+  button.disabled = false;
+  button.textContent = '▶  Generate & play';
+  if (message) statusEl.textContent = message;
 }
-function clearResult(){
-  runId++;stopPlayback();cleanupUrls();chunks=[];activeIndex=-1;sentencesEl.replaceChildren();result.classList.add('hidden');statusEl.textContent='';statusEl.className='status';button.disabled=false;button.textContent='▶  Generate & play';
+
+function clearAll() {
+  stopRun();
+  cleanupUrls();
+  chunks = [];
+  activeIndex = -1;
+  textEl.replaceChildren();
+  sentencesEl.replaceChildren();
+  result.classList.add('hidden');
+  statusEl.textContent = '';
+  statusEl.className = 'status';
+  updateCount();
+  textEl.focus();
 }
-async function fetchChunk(text,voice,token){
-  const params=new URLSearchParams({text,voice});
-  const response=await fetch(`/generate?${params}`,{signal:controller.signal});
-  if(!response.ok){let msg=`Generation failed (${response.status})`;try{msg=(await response.json()).detail||msg}catch{};throw new Error(msg)}
-  const blob=await response.blob();if(!blob.size)throw new Error('Empty audio response');
-  if(token!==runId)throw new DOMException('Cancelled','AbortError');
-  const url=URL.createObjectURL(blob);urls.push(url);return url;
-}
-function ensureChunk(item,voice,token){
-  if(item.url)return Promise.resolve(item.url);
-  if(!item.promise)item.promise=fetchChunk(item.text,voice,token).then(url=>(item.url=url,url));
+
+async function fetchChunk(item, voice, token, signal) {
+  if (item.url) return { url: item.url, error: null };
+  if (item.promise) return item.promise;
+
+  item.promise = (async () => {
+    try {
+      const params = new URLSearchParams({ text: item.text, voice });
+      const response = await fetch(`/generate?${params}`, { signal });
+      if (!response.ok) {
+        let message = `Generation failed (${response.status})`;
+        try {
+          const body = await response.json();
+          if (body.detail) message = body.detail;
+        } catch (_) {}
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      if (!blob.size) throw new Error('The API returned an empty audio file.');
+      if (token !== runId) throw new DOMException('Cancelled', 'AbortError');
+      const url = URL.createObjectURL(blob);
+      urls.push(url);
+      item.url = url;
+      return { url, error: null };
+    } catch (error) {
+      if (error.name === 'AbortError') throw error;
+      return { url: null, error };
+    }
+  })();
+
   return item.promise;
 }
-let controller=null;
-async function playChunk(index,token){
-  if(token!==runId)return;
-  while(index<chunks.length&&token===runId){
-    const item=chunks[index];
-    if(!item.url){
-      $('resultLabel').textContent=`Generating ${index+1} of ${chunks.length}…`;
-      result.classList.add('is-busy');
-      try{item.url=await ensureChunk(item,voiceEl.value,token)}
-      catch(error){if(error.name==='AbortError')return;throw error}
-    }
-    if(token!==runId)return;
-    setActive(index);result.classList.remove('is-busy');result.classList.add('is-playing');
-    audio.src=item.url;download.href=item.url;download.download=`kelku-${voiceEl.value}-sentence-${index+1}.wav`;
-    try{await audio.play()}catch(error){if(error.name==='NotAllowedError'){statusEl.textContent='Press play on the audio control to continue.';throw error}throw error}
-    await new Promise((resolve,reject)=>{
-      const ended=()=>{cleanup();resolve()},failed=()=>{cleanup();reject(new Error('Audio playback failed'))};
-      const cleanup=()=>{audio.removeEventListener('ended',ended);audio.removeEventListener('error',failed);audio.removeEventListener('pause',paused)};
-      const paused=()=>{if(!isRunning){cleanup();resolve()}};
-      audio.addEventListener('ended',ended,{once:true});audio.addEventListener('error',failed,{once:true});audio.addEventListener('pause',paused,{once:true});
-    });
-    if(token!==runId)return;
-    index++;
-  }
-  if(token===runId){result.classList.remove('is-busy','is-playing');$('resultLabel').textContent='Playback complete';statusEl.textContent='';button.disabled=false;button.textContent='▶  Play again'}
+
+function waitForAudioEnd(token) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      audio.removeEventListener('ended', ended);
+      audio.removeEventListener('error', failed);
+      audio.removeEventListener('pause', paused);
+    };
+    const ended = () => { cleanup(); resolve(); };
+    const failed = () => { cleanup(); reject(new Error('Audio playback failed.')); };
+    const paused = () => {
+      if (!isRunning || token !== runId) {
+        cleanup();
+        resolve();
+      }
+    };
+    audio.addEventListener('ended', ended, { once: true });
+    audio.addEventListener('error', failed, { once: true });
+    audio.addEventListener('pause', paused, { once: true });
+  });
 }
-$('ttsForm').addEventListener('submit',async event=>{
+
+async function runPlayback(token, voice, signal) {
+  let failedChunks = 0;
+
+  for (let index = 0; index < chunks.length; index++) {
+    if (token !== runId || signal.aborted) return;
+
+    $('resultLabel').textContent = `Generating ${index + 1} of ${chunks.length}…`;
+    result.classList.add('is-busy');
+
+    let outcome;
+    try {
+      outcome = await fetchChunk(chunks[index], voice, token, signal);
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      outcome = { url: null, error };
+    }
+
+    if (token !== runId || signal.aborted) return;
+
+    if (outcome.error || !outcome.url) {
+      failedChunks++;
+      const shortError = outcome.error?.message || 'Unknown generation error';
+      statusEl.textContent = `Sentence ${index + 1} skipped: ${shortError}`;
+      statusEl.className = 'status error';
+      chunks[index].failed = true;
+      setActive(index);
+      // Continue to the next sentence rather than failing the entire queue.
+      continue;
+    }
+
+    // Start fetching only the next sentence now. It runs while this chunk plays.
+    // The next loop iteration reuses the same in-flight promise.
+    if (index + 1 < chunks.length) {
+      fetchChunk(chunks[index + 1], voice, token, signal).catch(error => {
+        if (error.name !== 'AbortError') console.error('Prefetch failed:', error);
+      });
+    }
+
+    setActive(index);
+    result.classList.remove('is-busy');
+    result.classList.add('is-playing');
+    audio.src = outcome.url;
+    download.href = outcome.url;
+    download.download = `kelku-${voice}-sentence-${index + 1}.wav`;
+
+    try {
+      await audio.play();
+      await waitForAudioEnd(token);
+    } catch (error) {
+      if (token !== runId || signal.aborted || error.name === 'AbortError') return;
+      failedChunks++;
+      statusEl.textContent = `Sentence ${index + 1} playback failed. Skipping to the next sentence.`;
+      statusEl.className = 'status error';
+    }
+
+    if (token !== runId || signal.aborted) return;
+  }
+
+  if (token === runId && !signal.aborted) {
+    isRunning = false;
+    result.classList.remove('is-busy', 'is-playing');
+    stopButton.classList.add('hidden');
+    button.disabled = false;
+    button.textContent = '▶  Generate & play';
+    $('resultLabel').textContent = failedChunks
+      ? `Playback finished · ${failedChunks} sentence${failedChunks === 1 ? '' : 's'} skipped`
+      : 'Playback complete';
+    if (!failedChunks) {
+      statusEl.textContent = '';
+      statusEl.className = 'status';
+    }
+  }
+}
+
+textEl.addEventListener('input', () => {
+  if (isRunning) stopRun('Text changed. Generate again to play the updated text.');
+  updateCount();
+});
+updateCount();
+
+$('ttsForm').addEventListener('submit', async event => {
   event.preventDefault();
-  const token=++runId; if(controller)controller.abort();controller=new AbortController();stopPlayback();cleanupUrls();
-  const text=textEl.value.trim(),voice=voiceEl.value;
-  if(!text){statusEl.textContent='Enter text first.';statusEl.className='status error';return}
-  chunks=splitSentences(text).map(text=>({text,url:null}));
-  if(!chunks.length){statusEl.textContent='Enter text first.';statusEl.className='status error';return}
+
+  if (isRunning) stopRun();
+  cleanupUrls();
+
+  const text = editorText().trim();
+  const voice = voiceEl.value;
+  if (!text) {
+    statusEl.textContent = 'Enter text first.';
+    statusEl.className = 'status error';
+    return;
+  }
+  if (text.length > 2000) {
+    statusEl.textContent = 'Maximum text length is 2000 characters.';
+    statusEl.className = 'status error';
+    return;
+  }
+
+  chunks = splitSentences(text).map(sentence => ({ text: sentence, url: null, promise: null }));
+  if (!chunks.length) {
+    statusEl.textContent = 'Enter text first.';
+    statusEl.className = 'status error';
+    return;
+  }
+
+  const token = ++runId;
+  controller = new AbortController();
+  const signal = controller.signal;
+  isRunning = true;
+  activeIndex = -1;
+
+  renderEditorChunks();
   sentencesEl.replaceChildren();
-  chunks.forEach((item,index)=>{const node=document.createElement('div');node.className='sentence';node.textContent=item.text;node.dataset.index=index;sentencesEl.appendChild(node)});
-  result.classList.remove('hidden');result.classList.add('is-busy');statusEl.className='status';statusEl.textContent='';
-  button.disabled=true;button.textContent='Generating…';$('resultLabel').textContent=`Preparing ${chunks.length} sentence${chunks.length===1?'':'s'}…`;
-  // Fetch the next chunk in the background while the current sentence plays.
-  let producerError=null,producerDone=false;
-  const producer=(async()=>{try{for(let i=0;i<chunks.length;i++){if(token!==runId)return;await ensureChunk(chunks[i],voice,token)}}catch(error){if(error.name!=='AbortError')producerError=error}finally{producerDone=true}})();
-  try{
-    // The first chunk is played as soon as it is ready; later chunks are prefetched concurrently.
-    await playChunk(0,token);
-    await producer;
-    if(producerError&&token===runId)throw producerError;
-  }catch(error){
-    if(error.name!=='AbortError'&&token===runId){statusEl.textContent=error.message||'Could not generate speech.';statusEl.className='status error';$('resultLabel').textContent='Could not complete';result.classList.remove('is-busy','is-playing');button.disabled=false;button.textContent='↻ Try again'}
-  }finally{
-    if(token===runId){button.disabled=false;if($('resultLabel').textContent!=='Playback complete')button.textContent='▶  Play again'}
+  chunks.forEach(chunk => {
+    const node = document.createElement('div');
+    node.className = 'sentence';
+    node.textContent = chunk.text;
+    sentencesEl.appendChild(node);
+  });
+
+  result.classList.remove('hidden');
+  result.classList.add('is-busy');
+  statusEl.className = 'status';
+  statusEl.textContent = '';
+  button.disabled = true;
+  button.textContent = 'Generating…';
+  stopButton.classList.remove('hidden');
+  $('resultLabel').textContent = `Preparing ${chunks.length} sentence${chunks.length === 1 ? '' : 's'}…`;
+
+  try {
+    await runPlayback(token, voice, signal);
+  } catch (error) {
+    if (error.name !== 'AbortError' && token === runId) {
+      statusEl.textContent = error.message || 'Could not generate speech.';
+      statusEl.className = 'status error';
+      $('resultLabel').textContent = 'Could not complete';
+      result.classList.remove('is-busy', 'is-playing');
+    }
+  } finally {
+    if (token === runId) {
+      isRunning = false;
+      button.disabled = false;
+      stopButton.classList.add('hidden');
+      if ($('resultLabel').textContent === 'Could not complete') {
+        button.textContent = '↻ Try again';
+      } else if ($('resultLabel').textContent !== 'Playback complete' &&
+                 !$('resultLabel').textContent.startsWith('Playback finished')) {
+        button.textContent = '▶  Generate & play';
+      }
+    }
   }
 });
-audio.addEventListener('play',()=>result.classList.add('is-playing'));
-audio.addEventListener('ended',()=>result.classList.remove('is-playing'));
-$('clear').addEventListener('click',clearResult);
+
+stopButton.addEventListener('click', () => {
+  stopRun('Playback stopped.');
+});
+
+$('clear').addEventListener('click', clearAll);
+audio.addEventListener('play', () => result.classList.add('is-playing'));
+audio.addEventListener('ended', () => result.classList.remove('is-playing'));
 </script>
 </body>
 </html>"""
